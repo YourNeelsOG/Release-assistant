@@ -1,0 +1,15 @@
+data/*
+!data/__init__.py
+!data/example-config.py
+!data/tags.json
+!data/version.py
+!data/templates/
+data/templates/user-args.json
+tmp/
+logs/
+cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+.env

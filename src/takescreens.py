@@ -1,0 +1,1940 @@
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
+import asyncio
+import gc
+import glob
+import json
+import os
+import platform
+import random
+import re
+import sys
+import time
+import traceback
+from collections.abc import Awaitable, Mapping
+from pathlib import Path
+from typing import Any, Optional, Union, cast
+
+import ffmpeg
+import psutil
+from pymediainfo import MediaInfo
+
+from src.cleanup import cleanup_manager
+from src.console import console
+
+default_config: dict[str, Any] = {}
+task_limit = 1
+cutoff = 1
+ffmpeg_limit = False
+ffmpeg_is_good = False
+use_libplacebo = True
+tone_map = False
+ffmpeg_compression = "6"
+algorithm = "mobius"
+desat = 10.0
+
+
+def _apply_config(config: Mapping[str, Any]) -> None:
+    global default_config, task_limit, cutoff
+    global ffmpeg_limit, ffmpeg_is_good, use_libplacebo
+    global tone_map, ffmpeg_compression, algorithm, desat
+
+    default_section = config.get('DEFAULT', {})
+    default_config = cast(dict[str, Any], default_section) if isinstance(default_section, Mapping) else {}
+
+    try:
+        task_limit = int(default_config.get('process_limit', 1) or 1)
+    except (TypeError, ValueError):
+        task_limit = 1
+
+    try:
+        cutoff = int(default_config.get('cutoff_screens', 1) or 1)
+    except (TypeError, ValueError):
+        cutoff = 1
+
+    ffmpeg_limit = default_config.get('ffmpeg_limit', False)
+    ffmpeg_is_good = default_config.get('ffmpeg_is_good', False)
+    use_libplacebo = default_config.get('use_libplacebo', True)
+    tone_map = default_config.get('tone_map', False)
+    ffmpeg_compression = str(default_config.get('ffmpeg_compression', '6'))
+    algorithm = str(default_config.get('algorithm', 'mobius')).strip()
+    try:
+        desat = float(default_config.get('desat', 10.0))
+    except (TypeError, ValueError):
+        desat = 10.0
+
+
+async def run_ffmpeg(command: Any) -> tuple[Optional[int], bytes, bytes]:
+    # On Linux prefer bundled amd/arm binary when present; otherwise fall back to system ffmpeg.
+    if platform.system() == 'Linux':
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+        ff_bin_dir = os.path.join(base_dir, 'bin', 'ffmpeg')
+
+        machine = platform.machine().lower()
+        if machine in ('x86_64', 'amd64'):
+            arch = 'amd'
+        elif machine in ('aarch64', 'arm64'):
+            arch = 'arm'
+        else:
+            arch = None
+
+        if arch:
+            candidate = os.path.join(ff_bin_dir, arch, 'ffmpeg')
+            if os.path.exists(candidate):
+                cmd_list = list(command.compile())
+                cmd_list[0] = candidate
+
+                process = await asyncio.create_subprocess_exec(
+                    *cmd_list,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                return (process.returncode if process.returncode is not None else -1), stdout, stderr
+
+    # Fallback: use system/default ffmpeg (command.compile())
+    process = await asyncio.create_subprocess_exec(
+        *command.compile(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    return process.returncode, stdout, stderr
+
+
+async def sanitize_filename(filename: str) -> str:
+    # Replace invalid characters like colons with an underscore
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
+
+
+def round_to_even(value: float) -> int:
+    rounded = int(round(value))
+    if rounded % 2 != 0:
+        rounded += 1
+    return rounded
+
+
+async def disc_screenshots(
+        meta: dict[str, Any],
+        filename: str,
+        bdinfo: dict[str, Any],
+        folder_id: str,
+        base_dir: str,
+        use_vs: bool,
+        image_list: Union[list[dict[str, str]], None] = None,
+        ffdebug: bool = False,
+        num_screens: int = 0,
+        force_screenshots: bool = False
+) -> None:
+    img_host = await get_image_host(meta)
+    screens = meta['screens']
+    start_time = time.time() if meta.get('debug') else 0.0
+    if 'image_list' not in meta:
+        meta['image_list'] = []
+    image_list_entries = cast(list[dict[str, Any]], meta['image_list'])
+    existing_images: list[dict[str, Any]] = [
+        img
+        for img in image_list_entries
+        if str(img.get('img_url', '')).startswith('http')
+    ]
+
+    if len(existing_images) >= cutoff and not force_screenshots:
+        console.print(f"[yellow]There are already at least {cutoff} images in the image list. Skipping additional screenshots.")
+        return
+
+    if not num_screens:
+        num_screens = screens
+    if num_screens == 0 or (image_list and len(image_list) >= num_screens):
+        return
+
+    sanitized_filename = await sanitize_filename(filename)
+    length: float = 0.0
+    file_path: str = ""
+    frame_rate: Optional[float] = None
+    bdinfo_files = cast(list[dict[str, Any]], bdinfo.get('files', []))
+    bdinfo_path = cast(str, bdinfo.get('path', ''))
+    for each in bdinfo_files:
+        # Calculate total length in seconds, including fractional part
+        length_str = str(each.get('length', '0'))
+        int_length = sum(float(x) * 60 ** i for i, x in enumerate(reversed(length_str.split(':'))))
+
+        if int_length > length:
+            length = int_length
+            for root, _dirs, files in os.walk(bdinfo_path):
+                for name in files:
+                    if name.lower() == str(each.get('file', '')).lower():
+                        file_path = os.path.join(root, name)
+                        break  # Stop searching once the file is found
+
+    if 'video' in bdinfo and bdinfo['video']:
+        fps_string = bdinfo['video'][0].get('fps', None)
+        if fps_string:
+            try:
+                frame_rate = float(fps_string.split(' ')[0])  # Extract and convert to float
+            except ValueError:
+                console.print("[red]Error: Unable to parse frame rate from bdinfo['video'][0]['fps']")
+
+    file_path = str(file_path)
+
+    keyframe = 'nokey' if "VC-1" in bdinfo['video'][0]['codec'] or bdinfo['video'][0]['hdr_dv'] != "" else 'none'
+    if meta['debug']:
+        console.print(f"File: {file_path}, Length: {length}, Frame Rate: {frame_rate}", markup=False)
+    os.chdir(f"{base_dir}/tmp/{folder_id}")
+    existing_screens = glob.glob(f"{sanitized_filename}-*.png")
+    total_existing = len(existing_screens) + len(existing_images)
+    num_screens = max(0, screens - total_existing) if not force_screenshots else num_screens
+
+    if num_screens == 0 and not force_screenshots:
+        console.print('[bold green]Reusing existing screenshots. No additional screenshots needed.')
+        return
+
+    if meta['debug'] and not force_screenshots:
+        console.print(f"[bold yellow]Saving Screens... Total needed: {screens}, Existing: {total_existing}, To capture: {num_screens}")
+
+    if tone_map and "HDR" in meta['hdr']:
+        hdr_tonemap = True
+        meta['tonemapped'] = True
+    else:
+        hdr_tonemap = False
+
+    ss_times = await valid_ss_time([], num_screens, length, frame_rate or 24.0, meta, retake=force_screenshots)
+
+    if meta.get('frame_overlay', False):
+        console.print("[yellow]Getting frame information for overlays...")
+        # Build list of (original_index, task) to preserve index correspondence
+        frame_info_tasks_with_idx = [
+            (i, get_frame_info(file_path, ss_times[i], meta))
+            for i in range(num_screens + 1)
+            if not os.path.exists(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-{len(existing_screens) + i}.png")
+            or meta.get('retake', False)
+        ]
+        frame_info_results = await asyncio.gather(*[task for _, task in frame_info_tasks_with_idx])
+        meta['frame_info_map'] = {}
+
+        # Create a mapping from time to frame info using preserved indices
+        for (orig_idx, _), info in zip(frame_info_tasks_with_idx, frame_info_results):
+            meta['frame_info_map'][ss_times[orig_idx]] = info
+
+        if meta['debug']:
+            console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
+
+    num_workers = min(num_screens, task_limit)
+
+    if meta['debug']:
+        console.print(f"Using {num_workers} worker(s) for {num_screens} image(s)")
+
+    capture_tasks: list[Awaitable[Optional[tuple[int, str]]]] = []
+    capture_results: list[str] = []
+    valid_results: list[str] = []
+    remaining_retakes: list[str] = []
+    if use_vs:
+        from src.vs import vs_screengn
+        vs_screengn(source=file_path, encode=None, num=num_screens, dir=f"{base_dir}/tmp/{folder_id}/")
+    else:
+        loglevel = 'verbose' if ffdebug else 'quiet'
+
+        existing_indices = {int(p.split('-')[-1].split('.')[0]) for p in existing_screens}
+
+        # Create semaphore to limit concurrent tasks
+        semaphore = asyncio.Semaphore(task_limit)
+
+        async def capture_disc_with_semaphore(
+            index: int,
+            file: str,
+            ss_time: str,
+            image_path: str,
+            keyframe: str,
+            loglevel: str,
+            hdr_tonemap: bool,
+            meta: dict[str, Any]
+        ) -> Optional[tuple[int, str]]:
+            async with semaphore:
+                return await capture_disc_task(index, file, ss_time, image_path, keyframe, loglevel, hdr_tonemap, meta)
+
+        capture_tasks = [
+            capture_disc_with_semaphore(
+                i,
+                file_path,
+                ss_times[i],
+                os.path.abspath(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-{len(existing_indices) + i}.png"),
+                keyframe,
+                loglevel,
+                hdr_tonemap,
+                meta
+            )
+            for i in range(num_screens + 1)
+        ]
+
+        results = await asyncio.gather(*capture_tasks)
+        filtered_results: list[tuple[int, str]] = [r for r in results if r is not None]
+
+        if len(filtered_results) != len(results):
+            console.print(f"[yellow]Warning: {len(results) - len(filtered_results)} capture tasks returned invalid results.")
+
+        filtered_results.sort(key=lambda x: x[0])  # Ensure order is preserved
+        capture_results = [r[1] for r in filtered_results]
+
+        if capture_results and len(capture_results) > num_screens:
+            try:
+                smallest: str = min(capture_results, key=os.path.getsize)
+                if meta['debug']:
+                    console.print(f"[yellow]Removing smallest image: {smallest} ({os.path.getsize(smallest)} bytes)")
+                os.remove(smallest)
+                capture_results.remove(smallest)
+            except Exception as e:
+                console.print(f"[red]Error removing smallest image: {str(e)}")
+
+        if not force_screenshots and meta['debug']:
+            console.print(f"[green]Successfully captured {len(capture_results)} screenshots.")
+
+        valid_results = []
+        remaining_retakes = []
+        for image_path in capture_results:
+            if "Error" in image_path:
+                console.print(f"[red]{image_path}")
+                continue
+
+            retake = False
+            image_size = os.path.getsize(image_path)
+            if meta['debug']:
+                console.print(f"[yellow]Checking image {image_path} (size: {image_size} bytes) for image host: {img_host}[/yellow]")
+            if image_size <= 75000:
+                console.print(f"[yellow]Image {image_path} is incredibly small, retaking.")
+                retake = True
+            else:
+                if img_host and "imgbb" in img_host:
+                    if image_size <= 31000000:
+                        if meta['debug']:
+                            console.print(f"[green]Image {image_path} meets size requirements for imgbb.[/green]")
+                    else:
+                        console.print(f"[red]Image {image_path} with size {image_size} bytes: does not meet size requirements for imgbb, retaking.")
+                        retake = True
+                elif img_host and img_host in ["imgbox", "pixhost"]:
+                    if 75000 < image_size <= 10000000:
+                        if meta['debug']:
+                            console.print(f"[green]Image {image_path} meets size requirements for {img_host}.[/green]")
+                    else:
+                        console.print(f"[red]Image {image_path} with size {image_size} bytes: does not meet size requirements for {img_host}, retaking.")
+                        retake = True
+                elif img_host and img_host in ["ptpimg", "lensdump", "ptscreens", "onlyimage", "freeimage", "dalexni", "zipline", "passtheimage", "seedpool_cdn", "sharex", "utppm"]:
+                    if meta['debug']:
+                        console.print(f"[green]Image {image_path} meets size requirements for {img_host}.[/green]")
+                else:
+                    console.print(f"[red]Unknown image host or image doesn't meet requirements for host: {img_host}, retaking.")
+                    retake = True
+
+            if retake:
+                retry_attempts = 3
+                for attempt in range(1, retry_attempts + 1):
+                    console.print(f"[yellow]Retaking screenshot for: {image_path} (Attempt {attempt}/{retry_attempts})[/yellow]")
+                    try:
+                        index = int(image_path.rsplit('-', 1)[-1].split('.')[0])
+                        if os.path.exists(image_path):
+                            os.remove(image_path)
+
+                        random_time = random.uniform(0, length)  # nosec B311 - Random screenshot timing, not cryptographic
+                        screenshot_response = await capture_disc_task(
+                            index, file_path, str(random_time), image_path, keyframe, loglevel, hdr_tonemap, meta
+                        )
+                        new_size = os.path.getsize(image_path)
+                        valid_image = False
+
+                        if img_host and "imgbb" in img_host:
+                            if new_size > 75000 and new_size <= 31000000:
+                                console.print(f"[green]Successfully retaken screenshot for: {image_path} ({new_size} bytes)[/green]")
+                                valid_image = True
+                        elif img_host and img_host in ["imgbox", "pixhost"]:
+                            if new_size > 75000 and new_size <= 10000000:
+                                console.print(f"[green]Successfully retaken screenshot for: {image_path} ({new_size} bytes)[/green]")
+                                valid_image = True
+                        elif img_host and img_host in ["ptpimg", "lensdump", "ptscreens", "onlyimage", "freeimage", "dalexni", "zipline", "passtheimage", "seedpool_cdn", "sharex", "utppm"] and new_size > 75000:
+                            console.print(f"[green]Successfully retaken screenshot for: {image_path} ({new_size} bytes)[/green]")
+                            valid_image = True
+
+                        if valid_image:
+                            valid_results.append(image_path)
+                            break
+                        else:
+                            console.print(f"[red]Retaken image {screenshot_response} does not meet the size requirements for {img_host}. Retrying...[/red]")
+                    except Exception as e:
+                        console.print(f"[red]Error retaking screenshot for {image_path}: {e}[/red]")
+                else:
+                    console.print(f"[red]All retry attempts failed for {image_path}. Skipping.[/red]")
+                    remaining_retakes.append(image_path)
+            else:
+                valid_results.append(image_path)
+
+        if remaining_retakes:
+            console.print(f"[red]The following images could not be retaken successfully: {remaining_retakes}[/red]")
+
+    if not force_screenshots and meta['debug']:
+        console.print(f"[green]Successfully captured {len(valid_results)} screenshots.")
+
+    if meta['debug']:
+        finish_time = time.time()
+        console.print(f"Screenshots processed in {finish_time - start_time:.4f} seconds")
+
+    multi_screens = int(default_config.get('multiScreens', 2))
+    discs = meta.get('discs', [])
+    one_disc = True
+    if discs and len(discs) == 1:
+        one_disc = True
+    elif discs and len(discs) > 1:
+        one_disc = False
+
+    if (not meta.get('tv_pack') and one_disc) or multi_screens == 0:
+        await cleanup_manager.cleanup()
+
+
+async def capture_disc_task(index: int, file: str, ss_time: str, image_path: str, keyframe: str, loglevel: str, hdr_tonemap: bool, meta: dict[str, Any]) -> Optional[tuple[int, str]]:
+    try:
+        # Build filter chain
+        vf_filters: list[str] = []
+
+        if hdr_tonemap:
+            vf_filters.extend([
+                "zscale=transfer=linear",
+                f"tonemap=tonemap={algorithm}:desat={desat}",
+                "zscale=transfer=bt709",
+                "format=rgb24"
+            ])
+
+        if meta.get('frame_overlay', False):
+            # Get frame info from pre-collected data if available
+            frame_info = meta.get('frame_info_map', {}).get(str(ss_time), {})
+
+            frame_rate = meta.get('frame_rate', 24.0)
+            frame_number = int(float(ss_time) * frame_rate)
+
+            # If we have PTS time from frame info, use it to calculate a more accurate frame number
+            if 'pts_time' in frame_info:
+                # Only use PTS time for frame number calculation if it makes sense
+                # (sometimes seeking can give us a frame from the beginning instead of where we want)
+                pts_time = frame_info.get('pts_time', 0)
+                if pts_time > 1.0 and abs(pts_time - ss_time) < 10:
+                    frame_number = int(pts_time * frame_rate)
+
+            frame_type = frame_info.get('frame_type', 'Unknown')
+
+            text_size = int(default_config.get('overlay_text_size', 18))
+            # Get the resolution and convert it to integer
+            resol = int(''.join(filter(str.isdigit, meta.get('resolution', '1080p'))))
+            font_size = round(text_size*resol/1080)
+            x_all = round(10*resol/1080)
+
+            # Scale vertical spacing based on font size
+            line_spacing = round(font_size * 1.1)
+            y_number = x_all
+            y_type = y_number + line_spacing
+            y_hdr = y_type + line_spacing
+
+            # Frame number
+            vf_filters.append(
+                f"drawtext=text='Frame Number\\: {frame_number}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_number}:box=1:boxcolor=black@0.5"
+            )
+
+            # Frame type
+            vf_filters.append(
+                f"drawtext=text='Frame Type\\: {frame_type}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_type}:box=1:boxcolor=black@0.5"
+            )
+
+            # HDR status
+            if hdr_tonemap:
+                vf_filters.append(
+                    f"drawtext=text='Tonemapped HDR':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_hdr}:box=1:boxcolor=black@0.5"
+                )
+
+        # Build command
+        # Always ensure at least format filter is present for PNG compression to work
+        if not vf_filters:
+            vf_filters.append("format=rgb24")
+        vf_chain = ",".join(vf_filters)
+
+        # Build ffmpeg-python command and run via run_ffmpeg
+        info_command: Any = cast(Any, ffmpeg).input(file, ss=str(ss_time), skip_frame=keyframe).output(
+            image_path,
+            vframes=1,
+            vf=vf_chain,
+            compression_level=ffmpeg_compression,
+            pred='mixed'
+        ).global_args('-y', '-loglevel', loglevel, '-hide_banner')
+
+        if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+            console.print(f"[cyan]FFmpeg command: {' '.join(info_command.compile())}[/cyan]")
+
+        returncode, stdout, stderr = await run_ffmpeg(info_command)
+
+        # Print stdout and stderr if in verbose mode
+        if loglevel == 'verbose':
+            if stdout:
+                console.print(f"[blue]FFmpeg stdout:[/blue]\n{stdout.decode('utf-8', errors='replace')}")
+            if stderr:
+                console.print(f"[yellow]FFmpeg stderr:[/yellow]\n{stderr.decode('utf-8', errors='replace')}")
+
+        if returncode == 0:
+            return (index, image_path)
+        else:
+            console.print(f"[red]FFmpeg error capturing screenshot: {stderr.decode()}")
+            return None  # Ensure tuple format
+    except Exception as e:
+        console.print(f"[red]Error capturing screenshot: {e}")
+        return None
+
+
+async def dvd_screenshots(
+        meta: dict[str, Any],
+        disc_num: int,
+        num_screens: int = 0,
+        retry_cap: bool = False
+) -> None:
+    screens = meta['screens']
+    if 'image_list' not in meta:
+        meta['image_list'] = []
+    image_list_entries = cast(list[dict[str, Any]], meta['image_list'])
+    existing_images: list[dict[str, Any]] = [
+        img
+        for img in image_list_entries
+        if str(img.get('img_url', '')).startswith('http')
+    ]
+
+    if len(existing_images) >= cutoff and not retry_cap:
+        console.print(f"[yellow]There are already at least {cutoff} images in the image list. Skipping additional screenshots.")
+        return
+    screens = meta.get('screens', 6)
+    if not num_screens:
+        num_screens = screens - len(existing_images)
+    if num_screens == 0 or (len(meta.get('image_list', [])) >= screens and disc_num == 0):
+        return
+
+    sanitized_disc_name = await sanitize_filename(meta['discs'][disc_num]['name'])
+    if len(glob.glob(f"{meta['base_dir']}/tmp/{meta['uuid']}/{sanitized_disc_name}-*.png")) >= num_screens:
+        i = num_screens
+        console.print('[bold green]Reusing screenshots')
+        return
+
+    ifo_mi = MediaInfo.parse(f"{meta['discs'][disc_num]['path']}/VTS_{meta['discs'][disc_num]['main_set'][0][:2]}_0.IFO", mediainfo_options={'inform_version': '1'})
+    sar = 1.0
+    w_sar = 1.0
+    h_sar = 1.0
+    par: float = 1.0
+    dar: float = 1.0
+    width: float = 0.0
+    height: float = 0.0
+    frame_rate: float = 24.0
+    tracks: list[Any] = []
+    tracks.extend(cast(list[Any], getattr(ifo_mi, "tracks", [])))
+    for track in tracks:
+        if track.track_type == "Video":
+            if isinstance(track.duration, str):
+                durations = [float(d) for d in track.duration.split(' / ')]
+                _ = max(durations) / 1000  # Use the longest duration (unused)
+            else:
+                _ = float(track.duration) / 1000  # Convert to seconds (unused)
+
+            par = float(track.pixel_aspect_ratio)
+            dar = float(track.display_aspect_ratio)
+            width = float(track.width)
+            height = float(track.height)
+            frame_rate = float(track.frame_rate)
+    if par < 1:
+        new_height: float = dar * height
+        sar = width / new_height
+        w_sar = 1.0
+        h_sar = sar
+    else:
+        sar = par
+        w_sar = sar
+        h_sar = 1.0
+
+    async def _is_vob_good(n: int, loops: int, _num_screens: int) -> tuple[float, float]:
+        max_loops = 6
+        fallback_duration = 300
+        valid_tracks: list[dict[str, Any]] = []
+
+        while loops < max_loops:
+            try:
+                vob_mi = MediaInfo.parse(
+                    f"{meta['discs'][disc_num]['path']}/VTS_{main_set[n]}",
+                    output='JSON'
+                )
+                vob_mi = json.loads(str(vob_mi))
+
+                for track in vob_mi.get('media', {}).get('track', []):
+                    duration = float(track.get('Duration', 0))
+                    width = track.get('Width')
+                    height = track.get('Height')
+
+                    if duration > 1 and width and height:  # Minimum 1-second track
+                        valid_tracks.append({
+                            'duration': duration,
+                            'track_index': n
+                        })
+
+                if valid_tracks:
+                    # Sort by duration, take longest track
+                    longest_track: dict[str, Any] = max(valid_tracks, key=lambda x: x['duration'])
+                    return longest_track['duration'], longest_track['track_index']
+
+            except Exception as e:
+                console.print(f"[red]Error parsing VOB {n}: {e}")
+
+            n = (n + 1) % len(main_set)
+            loops += 1
+
+        return fallback_duration, 0.0
+
+    main_set = meta['discs'][disc_num]['main_set'][1:] if len(meta['discs'][disc_num]['main_set']) > 1 else meta['discs'][disc_num]['main_set']
+    os.chdir(f"{meta['base_dir']}/tmp/{meta['uuid']}")
+    voblength, _vob_index = await _is_vob_good(0, 0, num_screens)
+    ss_times = await valid_ss_time([], num_screens, voblength, frame_rate, meta, retake=retry_cap)
+    capture_tasks: list[Awaitable[tuple[int, Optional[str]]]] = []
+    existing_images_count = 0
+    existing_image_paths: list[str] = []
+
+    for i in range(num_screens + 1):
+        image = f"{meta['base_dir']}/tmp/{meta['uuid']}/{sanitized_disc_name}-{i}.png"
+        input_file = f"{meta['discs'][disc_num]['path']}/VTS_{main_set[i % len(main_set)]}"
+        if os.path.exists(image) and not meta.get('retake', False):
+            existing_images_count += 1
+            existing_image_paths.append(image)
+
+    if existing_images_count == num_screens and not meta.get('retake', False):
+        console.print("[yellow]The correct number of screenshots already exists. Skipping capture process.")
+        capture_results: list[str] = existing_image_paths
+        return
+    else:
+        capture_tasks = []
+        image_paths: list[str] = []
+        input_files: list[str] = []
+
+        for i in range(num_screens + 1):
+            image = f"{meta['base_dir']}/tmp/{meta['uuid']}/{sanitized_disc_name}-{i}.png"
+            input_file = f"{meta['discs'][disc_num]['path']}/VTS_{main_set[i % len(main_set)]}"
+            image_paths.append(image)
+            input_files.append(input_file)
+
+        if meta.get('frame_overlay', False):
+            if meta['debug']:
+                console.print("[yellow]Getting frame information for overlays...")
+            frame_info_tasks = [
+                get_frame_info(input_files[i], ss_times[i], meta)
+                for i in range(num_screens + 1)
+                if not os.path.exists(image_paths[i]) or meta.get('retake', False)
+            ]
+
+            frame_info_results = await asyncio.gather(*frame_info_tasks)
+            meta['frame_info_map'] = {}
+
+            for i, info in enumerate(frame_info_results):
+                meta['frame_info_map'][ss_times[i]] = info
+
+            if meta['debug']:
+                console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
+
+        num_workers = min(num_screens + 1, task_limit)
+
+        if meta['debug']:
+            console.print(f"Using {num_workers} worker(s) for {num_screens} image(s)")
+
+        # Create semaphore to limit concurrent tasks
+        semaphore = asyncio.Semaphore(task_limit)
+
+        async def capture_dvd_with_semaphore(args: tuple[int, str, str, str, dict[str, Any], float, float, float, float]) -> tuple[int, Optional[str]]:
+            async with semaphore:
+                return await capture_dvd_screenshot(args)
+
+        for i in range(num_screens + 1):
+            if not os.path.exists(image_paths[i]) or meta.get('retake', False):
+                capture_tasks.append(
+                    capture_dvd_with_semaphore(
+                        (i, input_files[i], image_paths[i], ss_times[i], meta, width, height, w_sar, h_sar)
+                    )
+                )
+
+        capture_results: list[str] = []
+        results = await asyncio.gather(*capture_tasks)
+        filtered_results: list[tuple[int, Optional[str]]] = list(results)
+
+        if len(filtered_results) != len(results):
+            console.print(f"[yellow]Warning: {len(results) - len(filtered_results)} capture tasks returned invalid results.")
+
+        filtered_results.sort(key=lambda x: x[0])  # Ensure order is preserved
+        capture_results = [r[1] for r in filtered_results if r[1] is not None]
+
+        if capture_results and len(capture_results) > num_screens:
+            smallest = None
+            smallest_size = float('inf')
+            for screens in [os.path.basename(f) for f in glob.glob(os.path.join(f"{meta['base_dir']}/tmp/{meta['uuid']}/", f"{meta['discs'][disc_num]['name']}-*"))]:
+                screen_path = os.path.join(f"{meta['base_dir']}/tmp/{meta['uuid']}/", screens)
+                try:
+                    screen_size = os.path.getsize(screen_path)
+                    if screen_size < smallest_size:
+                        smallest_size = screen_size
+                        smallest = screen_path
+                except FileNotFoundError:
+                    console.print(f"[red]File not found: {screen_path}[/red]")  # Handle potential edge cases
+                    continue
+
+            if smallest:
+                if meta['debug']:
+                    console.print(f"[yellow]Removing smallest image: {smallest} ({smallest_size} bytes)[/yellow]")
+                os.remove(smallest)
+                capture_results.remove(smallest)
+
+        valid_results: list[str] = []
+        remaining_retakes: list[str] = []
+
+        for image in capture_results:
+            if "Error" in image:
+                console.print(f"[red]{image}")
+                continue
+
+            retake = False
+            image_size = os.path.getsize(image)
+            if image_size <= 120000:
+                console.print(f"[yellow]Image {image} is incredibly small, retaking.")
+                retake = True
+
+            if retake:
+                retry_attempts = 3
+                for attempt in range(1, retry_attempts + 1):
+                    console.print(f"[yellow]Retaking screenshot for: {image} (Attempt {attempt}/{retry_attempts})[/yellow]")
+
+                    index = int(image.rsplit('-', 1)[-1].split('.')[0])
+                    input_file = f"{meta['discs'][disc_num]['path']}/VTS_{main_set[index % len(main_set)]}"
+                    adjusted_time = random.uniform(0, voblength)  # nosec B311 - Random screenshot timing, not cryptographic
+
+                    if os.path.exists(image):  # Prevent unnecessary deletion error
+                        try:
+                            os.remove(image)
+                        except Exception as e:
+                            console.print(f"[red]Failed to delete {image}: {e}[/red]")
+                            break
+
+                    try:
+                        screenshot_response = await capture_dvd_screenshot(
+                            (index, input_file, image, str(adjusted_time), meta, width, height, w_sar, h_sar)
+                        )
+
+                        index, screenshot_result = screenshot_response  # Safe unpacking
+
+                        if screenshot_result is None:
+                            console.print(f"[red]Failed to capture screenshot for {image}. Retrying...[/red]")
+                            continue
+
+                        retaken_size = os.path.getsize(screenshot_result)
+                        if retaken_size > 75000:
+                            console.print(f"[green]Successfully retaken screenshot for: {screenshot_result} ({retaken_size} bytes)[/green]")
+                            valid_results.append(screenshot_result)
+                            break
+                        else:
+                            console.print(f"[red]Retaken image {screenshot_result} is still too small. Retrying...[/red]")
+                    except Exception as e:
+                        console.print(f"[red]Error capturing screenshot for {input_file} at {adjusted_time}: {e}[/red]")
+
+                else:
+                    console.print(f"[red]All retry attempts failed for {image}. Skipping.[/red]")
+                    remaining_retakes.append(image)
+            else:
+                valid_results.append(image)
+        if remaining_retakes:
+            console.print(f"[red]The following images could not be retaken successfully: {remaining_retakes}[/red]")
+
+    if not retry_cap and meta['debug']:
+        console.print(f"[green]Successfully captured {len(valid_results)} screenshots.")
+
+    multi_screens = int(default_config.get('multiScreens', 2))
+    discs = meta.get('discs', [])
+    one_disc = True
+    if discs and len(discs) == 1:
+        one_disc = True
+    elif discs and len(discs) > 1:
+        one_disc = False
+
+    if (not meta.get('tv_pack') and one_disc) or multi_screens == 0:
+        await cleanup_manager.cleanup()
+
+
+async def capture_dvd_screenshot(task: tuple[int, str, str, str, dict[str, Any], float, float, float, float]) -> tuple[int, Optional[str]]:
+    index, input_file, image, seek_time_str, meta, width, height, w_sar, h_sar = task
+    seek_time = float(seek_time_str)
+
+    try:
+        loglevel = 'verbose' if meta.get('ffdebug', False) else 'quiet'
+        media_info = MediaInfo.parse(input_file)
+        video_duration: Optional[float] = None
+        tracks: list[Any] = []
+        tracks.extend(cast(list[Any], getattr(media_info, "tracks", [])))
+        for track in tracks:
+            if track.track_type == "Video":
+                try:
+                    if track.duration is not None:
+                        video_duration = float(track.duration)
+                except (TypeError, ValueError):
+                    video_duration = None
+                break
+
+        if video_duration and seek_time > video_duration:
+            seek_time = max(0, video_duration - 1)
+
+        # Build filter chain
+        vf_filters: list[str] = []
+        if w_sar != 1 or h_sar != 1:
+            scaled_w = round_to_even(width * w_sar)
+            scaled_h = round_to_even(height * h_sar)
+            vf_filters.append(f"scale={scaled_w}:{scaled_h}")
+
+        if meta.get('frame_overlay', False):
+            # Get frame info from pre-collected data if available
+            frame_info = meta.get('frame_info_map', {}).get(str(seek_time), {})
+
+            frame_rate = meta.get('frame_rate', 24.0)
+            frame_number = int(seek_time * frame_rate)
+
+            # If we have PTS time from frame info, use it to calculate a more accurate frame number
+            if 'pts_time' in frame_info:
+                # Only use PTS time for frame number calculation if it makes sense
+                # (sometimes seeking can give us a frame from the beginning instead of where we want)
+                pts_time = frame_info.get('pts_time', 0)
+                if pts_time > 1.0 and abs(pts_time - seek_time) < 10:
+                    frame_number = int(pts_time * frame_rate)
+
+            frame_type = frame_info.get('frame_type', 'Unknown')
+
+            text_size = int(default_config.get('overlay_text_size', 18))
+            # Get the resolution and convert it to integer
+            resol = int(''.join(filter(str.isdigit, meta.get('resolution', '576p'))))
+            font_size = round(text_size*resol/576)
+            x_all = round(10*resol/576)
+
+            # Scale vertical spacing based on font size
+            line_spacing = round(font_size * 1.1)
+            y_number = x_all
+            y_type = y_number + line_spacing
+
+            # Frame number
+            vf_filters.append(
+                f"drawtext=text='Frame Number\\: {frame_number}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_number}:box=1:boxcolor=black@0.5"
+            )
+
+            # Frame type
+            vf_filters.append(
+                f"drawtext=text='Frame Type\\: {frame_type}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_type}:box=1:boxcolor=black@0.5"
+            )
+
+        # Build command
+        # Always ensure at least format filter is present for PNG compression to work
+        if not vf_filters:
+            vf_filters.append("format=rgb24")
+        vf_chain = ",".join(vf_filters)
+
+        # Build ffmpeg-python command and run via run_ffmpeg
+        info_command: Any = cast(Any, ffmpeg).input(input_file, ss=str(seek_time), accurate_seek=None).output(
+            image,
+            vframes=1,
+            vf=vf_chain,
+            compression_level=ffmpeg_compression,
+            pred='mixed'
+        ).global_args('-y', '-loglevel', loglevel, '-hide_banner')
+
+        if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+            console.print(f"[cyan]FFmpeg command: {' '.join(info_command.compile())}[/cyan]", emoji=False)
+
+        returncode, _stdout, stderr = await run_ffmpeg(info_command)
+
+        if returncode != 0:
+            console.print(f"[red]Error capturing screenshot for {input_file} at {seek_time}s:[/red]\n{stderr.decode()}")
+            return (index, None)
+
+        if os.path.exists(image):
+            return (index, image)
+        else:
+            console.print(f"[red]Screenshot creation failed for {image}[/red]")
+            return (index, None)
+
+    except Exception as e:
+        console.print(f"[red]Error capturing screenshot for {input_file} at {seek_time}s: {e}[/red]")
+        return (index, None)
+
+
+async def screenshots(
+        path: str,
+        filename: str,
+        folder_id: str,
+        base_dir: str,
+        meta: dict[str, Any],
+        num_screens: int = 0,
+        force_screenshots: bool = False,
+        manual_frames: Union[str, list[str]] = "",
+) -> Union[list[str], None]:
+    img_host = await get_image_host(meta)
+    screens = meta['screens']
+    start_time = time.time() if meta.get('debug') else 0.0
+    if meta['debug']:
+        console.print("Image Host:", img_host)
+    if 'image_list' not in meta:
+        meta['image_list'] = []
+
+    image_list_entries = cast(list[dict[str, Any]], meta['image_list'])
+    existing_images: list[dict[str, Any]] = [
+        img
+        for img in image_list_entries
+        if str(img.get('img_url', '')).startswith('http')
+    ]
+
+    if len(existing_images) >= cutoff and not force_screenshots:
+        console.print(f"[yellow]There are already at least {cutoff} images in the image list. Skipping additional screenshots.")
+        return None
+
+    try:
+        mi_text = await asyncio.to_thread(Path(f"{base_dir}/tmp/{folder_id}/MediaInfo.json").read_text, encoding='utf-8')
+        mi = json.loads(mi_text)
+        video_track = mi['media']['track'][1]
+
+        def safe_float(value: Any, default: float = 0.0, field_name: str = "") -> float:
+            if isinstance(value, (int, float)):
+                return float(value)
+            elif isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    console.print(f"[yellow]Warning: Could not convert string '{value}' to float for {field_name}, using default {default}[/yellow]")
+                    return default
+            elif isinstance(value, dict):
+                for key in ['#value', 'value', 'duration', 'Duration']:
+                    if key in value:
+                        return safe_float(value[key], default, field_name)
+                console.print(f"[yellow]Warning: {field_name} is a dict but no usable value found: {value}, using default {default}[/yellow]")
+                return default
+            else:
+                console.print(f"[yellow]Warning: Unable to convert to float: {type(value)} {value} for {field_name}, using default {default}[/yellow]")
+                return default
+
+        length = safe_float(
+            video_track.get('Duration'),
+            safe_float(mi['media']['track'][0].get('Duration'), 3600.0, "General Duration"),
+            "Video Duration"
+        )
+
+        width = safe_float(video_track.get('Width'), 1920.0, "Width")
+        height = safe_float(video_track.get('Height'), 1080.0, "Height")
+        par = safe_float(video_track.get('PixelAspectRatio'), 1.0, "PixelAspectRatio")
+        dar = safe_float(video_track.get('DisplayAspectRatio'), 16.0/9.0, "DisplayAspectRatio")
+        frame_rate = safe_float(video_track.get('FrameRate'), 24.0, "FrameRate")
+
+        if par == 1:
+            sar = w_sar = h_sar = 1.0
+        elif par < 1:
+            new_height = dar * height
+            sar = width / new_height
+            w_sar = 1.0
+            h_sar = sar
+        else:
+            sar = w_sar = par
+            h_sar = 1
+    except Exception as e:
+        console.print(f"[red]Error processing MediaInfo.json: {e}")
+        if meta.get('debug', False):
+            import traceback
+            console.print(traceback.format_exc())
+        return None
+    meta['frame_rate'] = frame_rate
+    loglevel = 'verbose' if meta.get('ffdebug', False) else 'quiet'
+    os.chdir(f"{base_dir}/tmp/{folder_id}")
+
+    if manual_frames and meta['debug']:
+        console.print(f"[yellow]Using manual frames: {manual_frames}")
+    ss_times: list[str] = []
+    if manual_frames and not force_screenshots:
+        try:
+            manual_frames_list: list[int]
+            if isinstance(manual_frames, str):
+                manual_frames_list = [int(frame.strip()) for frame in manual_frames.split(',') if frame.strip()]
+            else:
+                manual_frames_list = [int(frame) for frame in manual_frames]
+            num_screens = len(manual_frames_list)
+            if num_screens > 0:
+                ss_times = [str(frame / frame_rate) for frame in manual_frames_list]
+        except (TypeError, ValueError) as e:
+            if meta['debug'] and manual_frames:
+                console.print(f"[red]Error processing manual frames: {e}[/red]")
+                sys.exit(1)
+
+    if num_screens <= 0:
+        num_screens = screens - len(existing_images)
+    if num_screens <= 0:
+        return None
+
+    sanitized_filename = await sanitize_filename(filename)
+    test_image_path = os.path.abspath(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-libplacebo-test.png")
+
+    existing_images_count = 0
+    existing_image_paths: list[str] = []
+    for i in range(num_screens):
+        image_path = os.path.abspath(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-{i}.png")
+        if os.path.exists(image_path) and not meta.get('retake', False):
+            existing_images_count += 1
+            existing_image_paths.append(image_path)
+
+    if existing_images_count == num_screens and not meta.get('retake', False):
+        console.print("[yellow]The correct number of screenshots already exists. Skipping capture process.")
+        return existing_image_paths
+
+    num_capture = num_screens - existing_images_count
+
+    if not ss_times:
+        ss_times = await valid_ss_time([], num_capture, length, frame_rate, meta, retake=force_screenshots)
+
+    if meta.get('frame_overlay', False):
+        if meta['debug']:
+            console.print("[yellow]Getting frame information for overlays...")
+        # Build list of (original_index, task) to preserve index correspondence
+        frame_info_tasks_with_idx = [
+            (i, get_frame_info(path, ss_times[i], meta))
+            for i in range(num_capture)
+            if not os.path.exists(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-{existing_images_count + i}.png")
+            or meta.get('retake', False)
+        ]
+        frame_info_results = await asyncio.gather(*[task for _, task in frame_info_tasks_with_idx])
+        meta['frame_info_map'] = {}
+
+        # Create a mapping from time to frame info using preserved indices
+        for (orig_idx, _), info in zip(frame_info_tasks_with_idx, frame_info_results):
+            meta['frame_info_map'][ss_times[orig_idx]] = info
+
+        if meta['debug']:
+            console.print(f"[cyan]Collected frame information for {len(frame_info_results)} frames")
+
+    num_tasks = num_capture
+    num_workers = min(num_tasks, task_limit)
+
+    meta['libplacebo'] = False
+    hdr_tonemap: bool = False
+    if tone_map and ("HDR" in meta['hdr'] or "DV" in meta['hdr'] or "HLG" in meta['hdr']):
+        if use_libplacebo and not meta.get('frame_overlay', False):
+            if not ffmpeg_is_good:
+                test_time = str(ss_times[0] if ss_times else 0)
+                libplacebo, compatible = await check_libplacebo_compatibility(
+                    w_sar, h_sar, width, height, path, test_time, test_image_path, loglevel, meta
+                )
+                if compatible:
+                    hdr_tonemap = True
+                    meta['tonemapped'] = True
+                if libplacebo:
+                    hdr_tonemap = True
+                    meta['tonemapped'] = True
+                    meta['libplacebo'] = True
+                if not compatible and not libplacebo:
+                    hdr_tonemap = False
+                    console.print("[yellow]FFMPEG failed tonemap checking.[/yellow]")
+                    await asyncio.sleep(2)
+                if not libplacebo and "HDR" not in meta.get('hdr', ''):
+                    hdr_tonemap = False
+            else:
+                hdr_tonemap = True
+                meta['tonemapped'] = True
+                meta['libplacebo'] = True
+        else:
+            if "HDR" not in meta.get('hdr', ''):
+                hdr_tonemap = False
+            else:
+                hdr_tonemap = True
+                meta['tonemapped'] = True
+    else:
+        hdr_tonemap = False
+
+    if meta['debug']:
+        console.print(f"Using {num_workers} worker(s) for {num_capture} image(s)")
+
+    # Create semaphore to limit concurrent tasks
+    semaphore = asyncio.Semaphore(num_workers)
+
+    async def capture_with_semaphore(args: tuple[int, str, float, str, float, float, float, float, str, bool, dict[str, Any]]) -> Optional[tuple[int, Optional[str]]]:
+        async with semaphore:
+            return await capture_screenshot(args)
+
+    capture_tasks: list[Awaitable[Optional[tuple[int, Optional[str]]]]] = []
+    for i in range(num_capture):
+        image_index = existing_images_count + i
+        image_path = os.path.abspath(f"{base_dir}/tmp/{folder_id}/{sanitized_filename}-{image_index}.png")
+        if not os.path.exists(image_path) or meta.get('retake', False):
+            capture_tasks.append(
+                capture_with_semaphore(
+                    (i, path, float(ss_times[i]), image_path, width, height, w_sar, h_sar, loglevel, hdr_tonemap, meta)
+                )
+            )
+
+    try:
+        results = cast(list[object], await asyncio.gather(*capture_tasks, return_exceptions=True))
+        # Log any error strings that were returned (these indicate exceptions in capture_screenshot)
+        for r in results:
+            if isinstance(r, Exception):
+                console.print(f"[red]Screenshot capture exception: {r}[/red]")
+        capture_result_tuples: list[tuple[int, Optional[str]]] = [
+            cast(tuple[int, Optional[str]], r)
+            for r in results
+            if isinstance(r, tuple)
+        ]
+        capture_result_tuples.sort(key=lambda x: x[0])
+        capture_results: list[str] = [r[1] for r in capture_result_tuples if r[1] is not None]
+
+    except KeyboardInterrupt:
+        console.print("\n[red]CTRL+C detected. Cancelling capture tasks...[/red]")
+        await asyncio.sleep(0.1)
+        await kill_all_child_processes()
+        console.print("[red]All tasks cancelled. Exiting.[/red]")
+        gc.collect()
+        cleanup_manager.reset_terminal()
+        sys.exit(1)
+    except asyncio.CancelledError:
+        await asyncio.sleep(0.1)
+        await kill_all_child_processes()
+        gc.collect()
+        cleanup_manager.reset_terminal()
+        sys.exit(1)
+    except Exception:
+        await asyncio.sleep(0.1)
+        await kill_all_child_processes()
+        gc.collect()
+        cleanup_manager.reset_terminal()
+        sys.exit(1)
+    finally:
+        await asyncio.sleep(0.1)
+        await kill_all_child_processes()
+        if meta['debug']:
+            console.print("[yellow]All capture tasks finished. Cleaning up...[/yellow]")
+
+    if not force_screenshots and meta['debug']:
+        console.print(f"[green]Successfully captured {len(capture_results)} screenshots.")
+
+    valid_results: list[str] = []
+    remaining_retakes: list[str] = []
+    for image_path in capture_results:
+        retake = False
+        image_size = os.path.getsize(image_path)
+        if meta['debug']:
+            console.print(f"[yellow]Checking image {image_path} (size: {image_size} bytes) for image host: {img_host}[/yellow]")
+        if not manual_frames:
+            if image_size <= 75000:
+                console.print(f"[yellow]Image {image_path} is incredibly small, retaking.")
+                retake = True
+            else:
+                if img_host and "imgbb" in img_host:
+                    if image_size <= 31000000:
+                        if meta['debug']:
+                            console.print(f"[green]Image {image_path} meets size requirements for imgbb.[/green]")
+                    else:
+                        console.print(f"[red]Image {image_path} with size {image_size} bytes: does not meet size requirements for imgbb, retaking.")
+                        retake = True
+                elif img_host and img_host in ["imgbox", "pixhost"]:
+                    if 75000 < image_size <= 10000000:
+                        if meta['debug']:
+                            console.print(f"[green]Image {image_path} meets size requirements for {img_host}.[/green]")
+                    else:
+                        console.print(f"[red]Image {image_path} with size {image_size} bytes: does not meet size requirements for {img_host}, retaking.")
+                        retake = True
+                elif img_host and img_host in ["ptpimg", "lensdump", "ptscreens", "onlyimage", "freeimage", "dalexni", "zipline", "passtheimage", "seedpool_cdn", "sharex", "utppm"]:
+                    if meta['debug']:
+                        console.print(f"[green]Image {image_path} meets size requirements for {img_host}.[/green]")
+                else:
+                    console.print(f"[red]Unknown image host or image doesn't meet requirements for host: {img_host}, retaking.")
+                    retake = True
+
+        if retake:
+            retry_attempts = 5
+            retry_offsets = [5.0, 10.0, -10.0, 100.0, -100.0]
+            frame_rate = meta.get('frame_rate', 24.0)
+            original_index = int(image_path.rsplit('-', 1)[-1].split('.')[0])
+            original_time = ss_times[original_index] if original_index < len(ss_times) else None
+
+            for attempt in range(1, retry_attempts + 1):
+                if original_time is not None:
+                    for offset in retry_offsets:
+                        adjusted_time = max(0, float(original_time) + offset)
+                        console.print(f"[yellow]Retaking screenshot for: {image_path} (Attempt {attempt}/{retry_attempts}) at {adjusted_time:.2f}s (offset {offset:+.2f}s)[/yellow]")
+                        try:
+                            if os.path.exists(image_path):
+                                os.remove(image_path)
+
+                            screenshot_response = await capture_screenshot((
+                                original_index, path, adjusted_time, image_path, width, height, w_sar, h_sar, loglevel, hdr_tonemap, meta
+                            ))
+
+                            if not isinstance(screenshot_response, tuple) or len(screenshot_response) != 2:
+                                continue
+
+                            _, screenshot_path = screenshot_response
+
+                            if not screenshot_path or not os.path.exists(screenshot_path):
+                                continue
+
+                            new_size = os.path.getsize(screenshot_path)
+                            valid_image = False
+
+                            if img_host and "imgbb" in img_host:
+                                if 75000 < new_size <= 31000000:
+                                    console.print(f"[green]Successfully retaken screenshot for: {screenshot_path} ({new_size} bytes)[/green]")
+                                    valid_image = True
+                            elif img_host and img_host in ["imgbox", "pixhost"]:
+                                if 75000 < new_size <= 10000000:
+                                    console.print(f"[green]Successfully retaken screenshot for: {screenshot_path} ({new_size} bytes)[/green]")
+                                    valid_image = True
+                            elif img_host and img_host in ["ptpimg", "lensdump", "ptscreens", "onlyimage", "freeimage", "dalexni", "zipline", "passtheimage", "seedpool_cdn", "sharex", "utppm"] and new_size > 75000:
+                                console.print(f"[green]Successfully retaken screenshot for: {screenshot_path} ({new_size} bytes)[/green]")
+                                valid_image = True
+
+                            if valid_image:
+                                valid_results.append(screenshot_path)
+                                break
+                        except Exception as e:
+                            console.print(f"[red]Error retaking screenshot for {image_path} at {adjusted_time:.2f}s: {e}[/red]")
+                    else:
+                        continue
+                    break
+                else:
+                    # Fallback: use random time if original_time is not available
+                    random_time = random.uniform(0, length)  # nosec B311 - Random screenshot timing, not cryptographic
+                    console.print(f"[yellow]Retaking screenshot for: {image_path} (Attempt {attempt}/{retry_attempts}) at random time {random_time:.2f}s[/yellow]")
+                    try:
+                        if os.path.exists(image_path):
+                            os.remove(image_path)
+
+                        screenshot_response = await capture_screenshot((
+                            original_index, path, random_time, image_path, width, height, w_sar, h_sar, loglevel, hdr_tonemap, meta
+                        ))
+
+                        if not isinstance(screenshot_response, tuple) or len(screenshot_response) != 2:
+                            continue
+
+                        _, screenshot_path = screenshot_response
+
+                        if not screenshot_path or not os.path.exists(screenshot_path):
+                            continue
+
+                        new_size = os.path.getsize(screenshot_path)
+                        valid_image = False
+
+                        if img_host and "imgbb" in img_host:
+                            if 75000 < new_size <= 31000000:
+                                valid_image = True
+                        elif img_host and img_host in ["imgbox", "pixhost"]:
+                            if 75000 < new_size <= 10000000:
+                                valid_image = True
+                        elif img_host and img_host in ["ptpimg", "lensdump", "ptscreens", "onlyimage", "freeimage", "dalexni", "zipline", "passtheimage", "seedpool_cdn", "sharex", "utppm"] and new_size > 75000:
+                            valid_image = True
+
+                        if valid_image:
+                            valid_results.append(screenshot_path)
+                            break
+                    except Exception as e:
+                        console.print(f"[red]Error retaking screenshot for {image_path} at random time {random_time:.2f}s: {e}[/red]")
+            else:
+                console.print(f"[red]All retry attempts failed for {image_path}. Skipping.[/red]")
+                remaining_retakes.append(image_path)
+                gc.collect()
+
+        else:
+            valid_results.append(image_path)
+
+    if remaining_retakes:
+        console.print(f"[red]The following images could not be retaken successfully: {remaining_retakes}[/red]")
+
+    if meta['debug']:
+        console.print(f"[green]Successfully processed {len(valid_results)} screenshots.")
+
+    if meta['debug']:
+        finish_time = time.time()
+        console.print(f"Screenshots processed in {finish_time - start_time:.4f} seconds")
+
+    multi_screens = int(default_config.get('multiScreens', 2))
+    discs = meta.get('discs', [])
+    one_disc = True
+    if discs and len(discs) == 1:
+        one_disc = True
+    elif discs and len(discs) > 1:
+        one_disc = False
+
+    if (not meta.get('tv_pack') and one_disc) or multi_screens == 0:
+        await cleanup_manager.cleanup()
+
+    return valid_results if valid_results else None
+
+
+async def capture_screenshot(args: tuple[int, str, float, str, float, float, float, float, str, bool, dict[str, Any]]) -> Optional[tuple[int, Optional[str]]]:
+    index, path, ss_time, image_path, width, height, w_sar, h_sar, loglevel, hdr_tonemap, meta = args
+
+    try:
+        def set_ffmpeg_threads() -> list[str]:
+            threads_value = '1'
+            os.environ['FFREPORT'] = 'level=32'  # Reduce ffmpeg logging overhead
+            return ['-threads', threads_value]
+        if width <= 0 or height <= 0:
+            return None
+
+        if ss_time < 0:
+            return None
+
+        scaled_w = round_to_even(width * w_sar)
+        scaled_h = round_to_even(height * h_sar)
+
+        # Normalize path for cross-platform compatibility
+        path = os.path.normpath(path)
+
+        # If path is a directory and meta has a filelist, use the first file from the filelist
+        if os.path.isdir(path):
+            error_msg = f"Error: Path is a directory, not a file: {path}"
+            console.print(f"[yellow]{error_msg}[/yellow]")
+
+            # Use meta that's passed directly to the function
+            if 'filelist' in meta and meta['filelist']:
+                video_file = meta['filelist'][0]
+                console.print(f"[green]Using first file from filelist: {video_file}[/green]")
+                path = video_file
+            else:
+                return None
+
+        # After potential path correction, validate again
+        if not os.path.exists(path):
+            error_msg = f"Error: Input file does not exist: {path}"
+            console.print(f"[red]{error_msg}[/red]")
+            return None
+
+        # Debug output showing the exact path being used
+        if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+            console.print(f"[cyan]Processing file: {path}[/cyan]")
+
+        if not meta.get('frame_overlay', False):
+            # Warm-up (only for first screenshot index or if not warmed)
+            if use_libplacebo:
+                warm_up = default_config.get('ffmpeg_warmup', False)
+                if warm_up:
+                    meta['_libplacebo_warmed'] = False
+                else:
+                    meta['_libplacebo_warmed'] = True
+                if "_libplacebo_warmed" not in meta:
+                    meta['_libplacebo_warmed'] = False
+                if hdr_tonemap and meta.get('libplacebo') and not meta.get('_libplacebo_warmed'):
+                    await libplacebo_warmup(path, meta, loglevel)
+
+            threads_value = set_ffmpeg_threads()
+            threads_val = threads_value[1]
+            vf_filters: list[str] = []
+
+            if w_sar != 1 or h_sar != 1:
+                scaled_w = round_to_even(width * w_sar)
+                scaled_h = round_to_even(height * h_sar)
+                vf_filters.append(f"scale={scaled_w}:{scaled_h}")
+                if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                    console.print(f"[cyan]Applied PAR scale -> {scaled_w}x{scaled_h}[/cyan]")
+
+            if hdr_tonemap:
+                if meta.get('libplacebo', False):
+                    vf_filters.append(
+                        "libplacebo=tonemapping=hable:colorspace=bt709:"
+                        "color_primaries=bt709:color_trc=bt709:range=tv"
+                    )
+                    if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                        console.print("[cyan]Using libplacebo tonemapping[/cyan]")
+                else:
+                    vf_filters.extend([
+                        "zscale=transfer=linear",
+                        f"tonemap=tonemap={algorithm}:desat={desat}",
+                        "zscale=transfer=bt709",
+                        "format=rgb24",
+                    ])
+                    if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                        console.print(f"[cyan]Using zscale tonemap chain (algo={algorithm}, desat={desat})[/cyan]")
+
+            vf_filters.append("format=rgb24")
+            vf_chain = ",".join(vf_filters) if vf_filters else "format=rgb24"
+
+            if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                console.print(f"[cyan]Final -vf chain: {vf_chain}[/cyan]")
+
+            threads_value = ['-threads', '1']
+            threads_val = threads_value[1]
+
+            def build_cmd(use_libplacebo: bool = True) -> Any:
+                inp = cast(Any, ffmpeg).input(path, ss=str(ss_time))
+                # Build output and global args
+                out_kwargs = {
+                    'vframes': 1,
+                    'vf': vf_chain,
+                    'compression_level': ffmpeg_compression,
+                    'pred': 'mixed'
+                }
+                info_cmd = inp.output(image_path, **out_kwargs)
+
+                global_args = ['-y', '-loglevel', loglevel, '-hide_banner', '-map', '0:v:0', '-an', '-sn']
+                if use_libplacebo and meta.get('libplacebo', False):
+                    global_args += ['-init_hw_device', 'vulkan']
+                if ffmpeg_limit:
+                    global_args += ['-threads', threads_val]
+
+                info_cmd = info_cmd.global_args(*global_args)
+                return info_cmd
+
+            cmd = build_cmd(use_libplacebo=True)
+
+            if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                # Disable emoji translation so 0:v:0 stays literal
+                try:
+                    compiled = cast(list[str], cmd.compile())
+                    console.print(f"[cyan]FFmpeg command: {' '.join(compiled)}[/cyan]", emoji=False)
+                except Exception:
+                    console.print("[cyan]FFmpeg command: (unable to render command)[/cyan]", emoji=False)
+
+            # --- Execute with retry/fallback if libplacebo fails ---
+            async def run_cmd(info_command: Any, timeout_sec: float) -> tuple[Optional[int], bytes, bytes]:
+                try:
+                    return await asyncio.wait_for(run_ffmpeg(info_command), timeout=timeout_sec)
+                except asyncio.TimeoutError:
+                    return -1, b"", b"Timeout"
+
+            info_cmd = build_cmd(use_libplacebo=True)
+            if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                console.print(f"[cyan]FFmpeg command: {' '.join(info_cmd.compile())}[/cyan]", emoji=False)
+
+            returncode, stdout, stderr = await run_cmd(info_cmd, 140)  # a bit longer for first pass
+            if returncode != 0 and hdr_tonemap and meta.get('libplacebo'):
+                # Retry once (shader compile might have delayed first invocation)
+                if loglevel == 'verbose' or meta.get('debug', False):
+                    console.print("[yellow]First libplacebo attempt failed; retrying once...[/yellow]")
+                await asyncio.sleep(1.0)
+                returncode, stdout, stderr = await run_cmd(info_cmd, 160)
+
+            if returncode != 0 and hdr_tonemap and meta.get('libplacebo'):
+                # Fallback: switch to zscale tonemap chain
+                if loglevel == 'verbose' or meta.get('debug', False):
+                    console.print("[red]libplacebo failed twice; falling back to zscale tonemap[/red]")
+                meta['libplacebo'] = False
+                # Rebuild chain with zscale
+                z_vf_filters: list[str] = []
+                if w_sar != 1 or h_sar != 1:
+                    z_vf_filters.append(f"scale={scaled_w}:{scaled_h}")
+                z_vf_filters.extend([
+                    "format=rgb24",
+                    "zscale=transfer=linear",
+                    f"tonemap=tonemap={algorithm}:desat={desat}",
+                    "zscale=transfer=bt709"
+                ])
+                vf_chain = ",".join(z_vf_filters)
+                info_cmd = build_cmd(use_libplacebo=False)
+                if loglevel == 'verbose' or meta.get('debug', False):
+                    console.print(f"[cyan]Fallback FFmpeg command: {' '.join(info_cmd.compile())}[/cyan]", emoji=False)
+                returncode, stdout, stderr = await run_cmd(info_cmd, 140)
+                cmd = info_cmd  # for logging below
+
+            if returncode == 0 and os.path.exists(image_path):
+                if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                    console.print(f"[green]Screenshot captured successfully: {image_path}[/green]")
+                return (index, image_path)
+            else:
+                if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+                    err_txt = (stderr or b"").decode(errors='replace').strip()
+                    console.print(f"[red]FFmpeg process failed (final): {err_txt}[/red]")
+                return (index, None)
+
+        # Proceed with screenshot capture
+        threads_value = set_ffmpeg_threads()
+        threads_val = threads_value[1]
+
+        # Build filter chain
+        vf_filters: list[str] = []
+
+        if w_sar != 1 or h_sar != 1:
+            scaled_w = round_to_even(width * w_sar)
+            scaled_h = round_to_even(height * h_sar)
+            vf_filters.append(f"scale={scaled_w}:{scaled_h}")
+
+        if hdr_tonemap:
+            vf_filters.extend([
+                "zscale=transfer=linear",
+                f"tonemap=tonemap={algorithm}:desat={desat}",
+                "zscale=transfer=bt709",
+                "format=rgb24",
+            ])
+
+        if meta.get('frame_overlay', False):
+            # Get frame info from pre-collected data if available
+            frame_info = meta.get('frame_info_map', {}).get(str(ss_time), {})
+
+            frame_rate = meta.get('frame_rate', 24.0)
+            frame_number = int(ss_time * frame_rate)
+
+            # If we have PTS time from frame info, use it to calculate a more accurate frame number
+            if 'pts_time' in frame_info:
+                # Only use PTS time for frame number calculation if it makes sense
+                # (sometimes seeking can give us a frame from the beginning instead of where we want)
+                pts_time = frame_info.get('pts_time', 0)
+                if pts_time > 1.0 and abs(pts_time - ss_time) < 10:
+                    frame_number = int(pts_time * frame_rate)
+
+            frame_type = frame_info.get('frame_type', 'Unknown')
+
+            text_size = int(default_config.get('overlay_text_size', 18))
+            # Get the resolution and convert it to integer
+            resol = int(''.join(filter(str.isdigit, meta.get('resolution', '1080p'))))
+            font_size = round(text_size*resol/1080)
+            x_all = round(10*resol/1080)
+
+            # Scale vertical spacing based on font size
+            line_spacing = round(font_size * 1.1)
+            y_number = x_all
+            y_type = y_number + line_spacing
+            y_hdr = y_type + line_spacing
+
+            # Frame number
+            vf_filters.append(
+                f"drawtext=text='Frame Number\\: {frame_number}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_number}:box=1:boxcolor=black@0.5"
+            )
+
+            # Frame type
+            vf_filters.append(
+                f"drawtext=text='Frame Type\\: {frame_type}':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_type}:box=1:boxcolor=black@0.5"
+            )
+
+            # HDR status
+            if hdr_tonemap:
+                vf_filters.append(
+                    f"drawtext=text='Tonemapped HDR':fontcolor=white:fontsize={font_size}:x={x_all}:y={y_hdr}:box=1:boxcolor=black@0.5"
+                )
+
+        # Build command
+        # Always ensure at least format filter is present for PNG compression to work
+        vf_filters.append("format=rgb24")
+        vf_chain = ",".join(vf_filters)
+
+        try:
+            info_cmd: Any = cast(Any, ffmpeg).input(path, ss=str(ss_time)).output(
+                image_path,
+                vframes=1,
+                vf=vf_chain,
+                compression_level=ffmpeg_compression,
+                pred='mixed'
+            ).global_args('-y', '-loglevel', loglevel, '-hide_banner', '-map', '0:v:0', '-an', '-sn')
+            if ffmpeg_limit:
+                info_cmd = info_cmd.global_args('-threads', threads_val)
+
+            if loglevel == 'verbose':
+                console.print(f"[cyan]FFmpeg command: {' '.join(info_cmd.compile())}[/cyan]")
+
+            returncode, stdout, stderr = await run_ffmpeg(info_cmd)
+            # Print stdout and stderr if in verbose mode
+            if loglevel == 'verbose':
+                if stdout:
+                    console.print(f"[blue]FFmpeg stdout:[/blue]\n{stdout.decode('utf-8', errors='replace')}")
+                if stderr:
+                    console.print(f"[yellow]FFmpeg stderr:[/yellow]\n{stderr.decode('utf-8', errors='replace')}")
+
+        except asyncio.CancelledError:
+            console.print(traceback.format_exc())
+            raise
+
+        if returncode == 0:
+            return (index, image_path)
+        else:
+            stderr_text = (stderr or b"").decode('utf-8', errors='replace')
+            if "Error initializing complex filters" in stderr_text:
+                console.print("[red]FFmpeg complex filters error: see https://github.com/Audionut/Upload-Assistant/wiki/ffmpeg---max-workers-issues[/red]")
+            else:
+                console.print(f"[red]FFmpeg error capturing screenshot: {stderr_text}[/red]")
+            return (index, None)
+    except Exception:
+        console.print(traceback.format_exc())
+        return None
+
+
+async def valid_ss_time(ss_times: list[str], num_screens: int, length: float, frame_rate: float, meta: dict[str, Any], retake: bool = False) -> list[str]:
+    total_screens = num_screens + 1 if meta['is_disc'] else num_screens
+    total_frames = int(length * frame_rate)
+
+    # Track retake calls and adjust start frame accordingly
+    retake_offset = 0
+    if retake:
+        if 'retake_call_count' not in meta:
+            meta['retake_call_count'] = 0
+
+        meta['retake_call_count'] += 1
+        retake_offset = meta['retake_call_count'] * 0.01
+
+        if meta['debug']:
+            console.print(f"[cyan]Retake call #{meta['retake_call_count']}, adding {retake_offset:.1%} offset[/cyan]")
+
+    # Calculate usable portion (from 1% to 90% of video)
+    if meta['category'] == "TV" and retake:
+        start_frame = int(total_frames * (0.1 + retake_offset))
+        end_frame = int(total_frames * 0.9)
+    elif meta['category'] == "Movie" and retake:
+        start_frame = int(total_frames * (0.05 + retake_offset))
+        end_frame = int(total_frames * 0.9)
+    else:
+        start_frame = int(total_frames * (0.05 + retake_offset))
+        end_frame = int(total_frames * 0.9)
+
+    # Ensure start_frame doesn't exceed reasonable bounds
+    max_start_frame = int(total_frames * 0.4)  # Don't start beyond 40%
+    start_frame = min(start_frame, max_start_frame)
+
+    usable_frames = end_frame - start_frame
+    chosen_frames: list[int] = []
+
+    frame_interval = usable_frames // total_screens if total_screens > 1 else usable_frames
+
+    result_times: list[str] = ss_times.copy()
+
+    for i in range(total_screens):
+        frame = start_frame + (i * frame_interval)
+        chosen_frames.append(frame)
+        time = frame / frame_rate
+        result_times.append(str(time))
+
+    if meta['debug']:
+        console.print(f"[purple]Screenshots information:[/purple] \n[slate_blue3]Screenshots: [gold3]{total_screens}[/gold3] \nTotal Frames: [gold3]{total_frames}[/gold3]")
+        console.print(f"[slate_blue3]Start frame: [gold3]{start_frame}[/gold3] \nEnd frame: [gold3]{end_frame}[/gold3] \nUsable frames: [gold3]{usable_frames}[/gold3][/slate_blue3]")
+        console.print(f"[yellow]frame interval: {frame_interval} \n[purple]Chosen Frames[/purple]\n[gold3]{chosen_frames}[/gold3]\n")
+
+    result_times = sorted(result_times)
+    return result_times
+
+
+async def kill_all_child_processes() -> None:
+    """Ensures all child processes are terminated."""
+    try:
+        current_process = psutil.Process()
+        children = current_process.children(recursive=True)  # Get child processes once
+
+        for child in children:
+            console.print(f"[red]Killing stuck worker process: {child.pid}[/red]")
+            child.terminate()
+
+        _gone, still_alive = psutil.wait_procs(children, timeout=3)  # Wait for termination
+        for process in still_alive:
+            console.print(f"[red]Force killing stubborn process: {process.pid}[/red]")
+            process.kill()
+    except (psutil.AccessDenied, PermissionError) as e:
+        # Handle restricted environments like Termux/Android where /proc/stat is inaccessible
+        console.print(f"[yellow]Warning: Unable to access process information (restricted environment): {e}[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]Warning: Error during child process cleanup: {e}[/yellow]")
+
+
+async def get_frame_info(path: str, ss_time: Union[str, float], meta: dict[str, Any]) -> dict[str, Any]:
+    """Get frame information (type, exact timestamp) for a specific frame"""
+    try:
+        ss_time_value = float(ss_time)
+        ffmpeg_module = cast(Any, ffmpeg)
+        info_ff = ffmpeg_module.input(path, ss=ss_time_value)
+        # Use video stream selector and apply showinfo filter
+        filtered = info_ff['v:0'].filter('showinfo')
+        info_command = (
+            filtered
+            .output('-', format='null', vframes=1)
+            .global_args('-loglevel', 'info')
+        )
+
+        # Print the actual FFmpeg command for debugging
+        cmd = cast(list[str], info_command.compile())
+        if meta.get('debug', False):
+            console.print(f"[cyan]FFmpeg showinfo command: {' '.join(cmd)}[/cyan]", emoji=False)
+
+        returncode, _, stderr = await run_ffmpeg(info_command)
+        # Check if subprocess completed properly
+        if returncode is None:
+            cmd_str = ' '.join(cmd)
+            raise RuntimeError(
+                f"FFmpeg subprocess did not complete properly. The process may have been "
+                f"terminated unexpectedly or failed to start. Command: {cmd_str}"
+            )
+        stderr_text = stderr.decode('utf-8', errors='replace')
+
+        # Calculate frame number based on timestamp and framerate
+        frame_rate = meta.get('frame_rate', 24.0)
+        calculated_frame = int(ss_time_value * frame_rate)
+
+        # Default values
+        frame_info: dict[str, Any] = {
+            'frame_type': 'Unknown',
+            'frame_number': calculated_frame
+        }
+
+        pict_type_match = re.search(r'pict_type:(\w)', stderr_text)
+        if pict_type_match:
+            frame_info['frame_type'] = pict_type_match.group(1)
+        else:
+            # Try alternative patterns that might appear in newer FFmpeg versions
+            alt_match = re.search(r'type:(\w)\s', stderr_text)
+            if alt_match:
+                frame_info['frame_type'] = alt_match.group(1)
+
+        pts_time_match = re.search(r'pts_time:(\d+\.\d+)', stderr_text)
+        if pts_time_match:
+            exact_time = float(pts_time_match.group(1))
+            frame_info['pts_time'] = exact_time
+            # Recalculate frame number based on exact PTS time if available
+            frame_info['frame_number'] = int(exact_time * frame_rate)
+
+        return frame_info
+
+    except Exception as e:
+        console.print(f"[yellow]Error getting frame info: {e}. Will use estimated values.[/yellow]")
+        if meta.get('debug', False):
+            console.print(traceback.format_exc())
+        return {
+            'frame_type': 'Unknown',
+            'frame_number': int(float(ss_time) * meta.get('frame_rate', 24.0))
+        }
+
+
+async def check_libplacebo_compatibility(w_sar: float, h_sar: float, width: float, height: float, path: str, ss_time: str, image_path: str, loglevel: str, meta: dict[str, Any]) -> tuple[bool, bool]:
+    test_image_path = image_path.replace('.png', '_test.png')
+
+    async def run_check(w_sar: float, h_sar: float, width: float, height: float, path: str, ss_time: str, _image_path: str, loglevel: str, meta: dict[str, Any], try_libplacebo: bool = False, test_image_path: str = "") -> bool:
+        filter_parts: list[str] = []
+        input_label = "[0:v]"
+        output_map = "0:v"  # Default output mapping
+
+        if w_sar != 1 or h_sar != 1:
+            scaled_w = round_to_even(width * w_sar)
+            scaled_h = round_to_even(height * h_sar)
+            filter_parts.append(f"{input_label}scale={scaled_w}:{scaled_h}[scaled]")
+            input_label = "[scaled]"
+            output_map = "[scaled]"
+
+        # Add libplacebo filter with output label
+        if try_libplacebo:
+            filter_parts.append(f"{input_label}libplacebo=tonemapping=auto:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv[out]")
+            output_map = "[out]"
+        else:
+            # Use -vf for zscale/tonemap chain, no output label or -map needed
+            vf_chain = f"zscale=transfer=linear,tonemap=tonemap={algorithm}:desat={desat},zscale=transfer=bt709,format=rgb24"
+
+        # Build ffmpeg-python command and run
+        if try_libplacebo:
+            info_cmd: Any = cast(Any, ffmpeg).input(path, ss=str(ss_time)).output(
+                test_image_path,
+                vframes=1,
+                pix_fmt='rgb24'
+            ).global_args('-y', '-loglevel', 'quiet', '-init_hw_device', 'vulkan', '-filter_complex', ','.join(filter_parts), '-map', output_map)
+        else:
+            vf_chain = f"zscale=transfer=linear,tonemap=tonemap={algorithm}:desat={desat},zscale=transfer=bt709,format=rgb24"
+            info_cmd: Any = cast(Any, ffmpeg).input(path, ss=str(ss_time)).output(
+                test_image_path,
+                vframes=1,
+                vf=vf_chain,
+                pix_fmt='rgb24'
+            ).global_args('-y', '-loglevel', 'quiet')
+
+        if loglevel == 'verbose' or (meta and meta.get('debug', False)):
+            console.print(f"[cyan]libplacebo compatibility test command: {' '.join(info_cmd.compile())}[/cyan]")
+
+        try:
+            retcode, _stdout, _stderr = await run_ffmpeg(info_cmd)
+            return retcode == 0
+        except Exception:
+            return False
+
+    if not meta['is_disc']:
+        is_libplacebo_compatible = await run_check(w_sar, h_sar, width, height, path, ss_time, image_path, loglevel, meta, try_libplacebo=True, test_image_path=test_image_path)
+        if is_libplacebo_compatible:
+            if meta['debug']:
+                console.print("[green]libplacebo compatibility test succeeded[/green]")
+            try:
+                if os.path.exists(test_image_path):
+                    os.remove(test_image_path)
+            except Exception:
+                pass
+            return True, True
+        else:
+            can_hdr = await run_check(w_sar, h_sar, width, height, path, ss_time, image_path, loglevel, meta, try_libplacebo=False, test_image_path=test_image_path)
+            if can_hdr:
+                if meta['debug']:
+                    console.print("[yellow]libplacebo compatibility test failed, but zscale HDR tonemapping is compatible[/yellow]")
+                # Clean up the test image regardless of success/failure
+                try:
+                    if os.path.exists(test_image_path):
+                        os.remove(test_image_path)
+                except Exception:
+                    pass
+                return False, True
+    return False, False
+
+
+async def libplacebo_warmup(path: str, meta: dict[str, Any], loglevel: str) -> None:
+    if not meta.get('libplacebo') or meta.get('_libplacebo_warmed'):
+        return
+    if not os.path.exists(path):
+        return
+    # Use a very small seek (0.1s) to avoid issues at pts 0
+    info_cmd: Any = cast(Any, ffmpeg).input(path, ss='0.1').output(
+        '-',
+        format='null',
+        vframes=1
+    ).global_args('-map', '0:v:0', '-an', '-sn', '-init_hw_device', 'vulkan', '-vf', "libplacebo=tonemapping=hable:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,format=rgb24", '-loglevel', 'error')
+    if loglevel == 'verbose' or meta.get('debug', False):
+        console.print("[cyan]Running libplacebo warm-up...[/cyan]", emoji=False)
+    try:
+        try:
+            await run_ffmpeg(info_cmd)
+        except Exception:
+            # Warmup failures are non-fatal; continue
+            if loglevel == 'verbose' or meta.get('debug', False):
+                console.print("[yellow]libplacebo warm-up failed or errored (continuing anyway)[/yellow]")
+        meta['_libplacebo_warmed'] = True
+    except Exception as e:
+        if loglevel == 'verbose' or meta.get('debug', False):
+            console.print(f"[yellow]libplacebo warm-up failed: {e} (continuing)[/yellow]")
+
+
+async def get_image_host(meta: dict[str, Any]) -> Optional[str]:
+    if meta.get('imghost') is not None:
+        host = meta['imghost']
+
+        if isinstance(host, str):
+            return host.lower().strip()
+
+        elif isinstance(host, list):
+            host_list = cast(list[Any], host)
+            for item in host_list:
+                if item and isinstance(item, str):
+                    return item.lower().strip()
+    else:
+        img_host_config: list[str] = [
+            str(default_config[key]).lower()
+            for key in sorted(default_config.keys())
+            if key.startswith("img_host_1") and not key.endswith("0")
+        ]
+        if img_host_config:
+            return img_host_config[0]
+    return None
+
+
+class TakeScreensManager:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        _apply_config(config)
+
+    async def run_ffmpeg(self, command: Any) -> tuple[Optional[int], bytes, bytes]:
+        return await run_ffmpeg(command)
+
+    async def sanitize_filename(self, filename: str) -> str:
+        return await sanitize_filename(filename)
+
+    async def disc_screenshots(
+            self,
+            meta: dict[str, Any],
+            filename: str,
+            bdinfo: dict[str, Any],
+            folder_id: str,
+            base_dir: str,
+            use_vs: bool,
+            image_list: Union[list[dict[str, str]], None] = None,
+            ffdebug: bool = False,
+            num_screens: int = 0,
+            force_screenshots: bool = False
+    ) -> None:
+        await disc_screenshots(
+            meta,
+            filename,
+            bdinfo,
+            folder_id,
+            base_dir,
+            use_vs,
+            image_list,
+            ffdebug,
+            num_screens,
+            force_screenshots
+        )
+
+    async def capture_disc_task(
+            self,
+            index: int,
+            file: str,
+            ss_time: str,
+            image_path: str,
+            keyframe: str,
+            loglevel: str,
+            hdr_tonemap: bool,
+            meta: dict[str, Any]
+    ) -> Optional[tuple[int, str]]:
+        return await capture_disc_task(index, file, ss_time, image_path, keyframe, loglevel, hdr_tonemap, meta)
+
+    async def dvd_screenshots(
+            self,
+            meta: dict[str, Any],
+            disc_num: int,
+            num_screens: int = 0,
+            retry_cap: bool = False
+    ) -> None:
+        await dvd_screenshots(meta, disc_num, num_screens, retry_cap)
+
+    async def capture_dvd_screenshot(
+            self,
+            task: tuple[int, str, str, str, dict[str, Any], float, float, float, float]
+    ) -> tuple[int, Optional[str]]:
+        return await capture_dvd_screenshot(task)
+
+    async def screenshots(
+            self,
+            path: str,
+            filename: str,
+            folder_id: str,
+            base_dir: str,
+            meta: dict[str, Any],
+            num_screens: int = 0,
+            force_screenshots: bool = False,
+            manual_frames: Union[str, list[str]] = "",
+    ) -> Optional[list[str]]:
+        return await screenshots(path, filename, folder_id, base_dir, meta, num_screens, force_screenshots, manual_frames)
+
+    async def capture_screenshot(
+            self,
+            args: tuple[int, str, float, str, float, float, float, float, str, bool, dict[str, Any]]
+    ) -> Optional[tuple[int, Optional[str]]]:
+        return await capture_screenshot(args)
+
+    async def valid_ss_time(
+            self,
+            ss_times: list[str],
+            num_screens: int,
+            length: float,
+            frame_rate: float,
+            meta: dict[str, Any],
+            retake: bool = False
+    ) -> list[str]:
+        return await valid_ss_time(ss_times, num_screens, length, frame_rate, meta, retake)
+
+    async def kill_all_child_processes(self) -> None:
+        await kill_all_child_processes()
+
+    async def get_frame_info(self, path: str, ss_time: str, meta: dict[str, Any]) -> dict[str, Any]:
+        return await get_frame_info(path, ss_time, meta)
+
+    async def check_libplacebo_compatibility(
+            self,
+            w_sar: float,
+            h_sar: float,
+            width: float,
+            height: float,
+            path: str,
+            ss_time: str,
+            image_path: str,
+            loglevel: str,
+            meta: dict[str, Any]
+    ) -> tuple[bool, bool]:
+        return await check_libplacebo_compatibility(
+            w_sar,
+            h_sar,
+            width,
+            height,
+            path,
+            ss_time,
+            image_path,
+            loglevel,
+            meta
+        )
+
+    async def libplacebo_warmup(self, path: str, meta: dict[str, Any], loglevel: str) -> None:
+        await libplacebo_warmup(path, meta, loglevel)
+
+    async def get_image_host(self, meta: dict[str, Any]) -> Optional[str]:
+        return await get_image_host(meta)
