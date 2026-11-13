@@ -33,7 +33,7 @@ The 68 registered adapters are listed below. Support means an adapter is include
 | BHDTV | BitHDTV | BJS | BrasilJapão-Share |
 | BLU | Blutopia | BT | BrasilTracker |
 | CBR | CapybaraBR | CZ | CinemaZ |
-| DC | DigitalCore | DP | DeshiPeer |
+| DC | DigitalCore | BYP | BytePeer |
 | DT | DT | EMUW | Emuwarez |
 | FF | FunFile | FL | FileList |
 | FNP | FearNoPeer | FRIKI | Friki |
@@ -61,7 +61,7 @@ The 68 registered adapters are listed below. Support means an adapter is include
 | ULCX | ULCX | UTP | UTOPIA |
 | YOINK | YOiNKED | YUS | YUSCENE |
 
-`DP` means DeshiPeer in this project. It uses a bearer API key and discovers personalized torrent URLs through its authenticated feed. Add your own key to `TRACKERS.DP.api_key`. An account with an accessible feed containing at least one torrent is required for URL discovery.
+`BYP` means BytePeer (formerly DeshiPeer) in this project. It uses a bearer API key and discovers personalized torrent URLs through its authenticated feed. Add your own key to `TRACKERS.BYP.api_key`. An account with an accessible feed containing at least one torrent is required for URL discovery.
 
 ## Requirements
 
@@ -181,8 +181,8 @@ The program creates working directories and tool downloads as needed. They are n
 * If configuration parsing fails, check Python syntax, indentation, quotation marks, and commas. Compare the affected section with `data/example-config.py`.
 * If metadata lookups fail, verify your own API credentials. TVDB is optional, but features that depend on its episode data need a working key and possibly a subscriber PIN.
 * If media inspection or screenshots fail, check that FFmpeg, ffprobe, and MediaInfo work from the same terminal. Disc inspection can require a first-run tool download.
-* If tracker authentication fails, check the selected adapter's keys, announce URL, cookie expiry, and upload permissions. DeshiPeer and AvistaZ stop when authentication or upload state cannot be verified.
-* If a release is rejected, review the tracker rules and duplicate results before retrying. For DeshiPeer, an accepted upload followed by a failed personalized download requires a manual download rather than another upload.
+* If tracker authentication fails, check the selected adapter's keys, announce URL, cookie expiry, and upload permissions. BytePeer and AvistaZ stop when authentication or upload state cannot be verified.
+* If a release is rejected, review the tracker rules and duplicate results before retrying. For BytePeer, an accepted upload followed by a failed personalized download requires a manual download rather than another upload.
 * If client injection fails, verify client credentials, connection settings, and local-to-remote path mapping.
 
 Live tracker uploads require real accounts and credentials and were not performed during distribution verification.

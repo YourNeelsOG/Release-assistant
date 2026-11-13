@@ -227,7 +227,7 @@ const trackerNameMap = {
   'CBR': 'CapybaraBR',
   'CZ': 'CinemaZ',
   'TIK': 'Cinematik',
-  'DP': 'DeshiPeer',
+  'BYP': 'BytePeer',
   'DC': 'DigitalCore',
   'EMUW': 'Emuwarez',
   'FNP': 'FearNoPeer',

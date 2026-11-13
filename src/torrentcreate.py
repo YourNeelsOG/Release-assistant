@@ -156,8 +156,8 @@ class TorrentCreator:
         if any(tracker in meta.get('trackers', []) for tracker in ['HDB', 'PTP']) and piece_size > 16 * 1024 * 1024:
             piece_size = 16 * 1024 * 1024
 
-        # DeshiPeer rejects smaller pieces, regardless of the normal size heuristic.
-        if 'DP' in meta.get('trackers', []):
+        # BytePeer rejects smaller pieces, regardless of the normal size heuristic.
+        if 'BYP' in meta.get('trackers', []):
             required = 16 * 1024 * 1024 if total_size > 1024 ** 3 else 1024 * 1024
             min_size = max(min_size, required)
 
@@ -297,17 +297,17 @@ class TorrentCreator:
                         if int(meta.get('randomized', 0)) >= 1:
                             cmd.extend(["-e"])
 
-                        if 'DP' in meta.get('trackers', []) and not piece_size:
+                        if 'BYP' in meta.get('trackers', []) and not piece_size:
                             piece_size = 16
 
-                        if piece_size and (not tracker_url or 'DP' in meta.get('trackers', [])):
+                        if piece_size and (not tracker_url or 'BYP' in meta.get('trackers', [])):
                             try:
                                 max_size_bytes = int(piece_size) * 1024 * 1024
 
                                 # Calculate the appropriate power of 2 (log2)
                                 # We want the largest power of 2 that's less than or equal to max_size_bytes
                                 power = min(27, max(16, math.floor(math.log2(max_size_bytes))))
-                                if 'DP' in meta.get('trackers', []):
+                                if 'BYP' in meta.get('trackers', []):
                                     power = max(24, power)
 
                                 cmd.extend(["-l", str(power)])

@@ -1252,11 +1252,11 @@ class QbittorrentClientMixin:
                 'rf': {"url": "https://reelflix.xyz", "pattern": r'/(\d+)$'},
                 'otw': {"url": "https://oldtoons.world", "pattern": r'/(\d+)$'},
                 'yus': {"url": "https://yu-scene.net", "pattern": r'/(\d+)$'},
-                'dp': {"url": "https://deshipeer.net", "pattern": r'torrentid=(\d+)'},
+                'byp': {"url": "https://bytepeer.net", "pattern": r'torrentid=(\d+)'},
                 'sp': {"url": "https://seedpool.org", "pattern": r'/(\d+)$'},
             }
 
-            tracker_priority = ['aither', 'ulcx', 'lst', 'blu', 'oe', 'btn', 'bhd', 'huno', 'hdb', 'rf', 'otw', 'yus', 'dp', 'sp', 'ptp']
+            tracker_priority = ['aither', 'ulcx', 'lst', 'blu', 'oe', 'btn', 'bhd', 'huno', 'hdb', 'rf', 'otw', 'yus', 'byp', 'sp', 'ptp']
 
             if proxy_url:
                 try:
@@ -1817,7 +1817,7 @@ async def match_tracker_url(tracker_urls: list[str], meta: dict[str, Any]) -> No
         'cbr': ["capybarabr.com"],
         'cz': ["tracker.cinemaz.to"],
         'dc': ["tracker.digitalcore.club", "trackerprxy.digitalcore.club"],
-        'dp': ["https://deshipeer.net"],
+        'byp': ["https://bytepeer.net"],
         'ff': ["tracker.funfile.org"],
         'fl': ["reactor.filelist", "reactor.thefl.org"],
         'fnp': ["https://fearnopeer.com"],
