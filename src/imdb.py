@@ -15,6 +15,12 @@ import httpx
 from src.cleanup import cleanup_manager
 from src.console import console
 
+# IMDb's GraphQL endpoint answers 403 to requests without a Referer.
+IMDB_GRAPHQL_HEADERS = {
+    "Content-Type": "application/json",
+    "Referer": "https://www.imdb.com/",
+}
+
 anitopy_parse_fn: Any = cast(Any, anitopy).parse
 guessit_module: Any = cast(Any, guessit)
 GuessitFn = Callable[[str, Optional[dict[str, Any]]], dict[str, Any]]
@@ -273,7 +279,7 @@ class ImdbManager:
                 response = await client.post(
                     "https://api.graphql.imdb.com/",
                     json=query,
-                    headers={"Content-Type": "application/json"},
+                    headers=IMDB_GRAPHQL_HEADERS,
                     timeout=10,
                 )
                 response.raise_for_status()
@@ -576,7 +582,7 @@ class ImdbManager:
 
             try:
                 async with httpx.AsyncClient() as client:
-                    response = await client.post(url, json=query, headers={"Content-Type": "application/json"}, timeout=10)
+                    response = await client.post(url, json=query, headers=IMDB_GRAPHQL_HEADERS, timeout=10)
                     response.raise_for_status()
                     data = response.json()
             except Exception as e:
@@ -950,7 +956,7 @@ class ImdbManager:
                 response = await client.post(
                     "https://api.graphql.imdb.com/",
                     json=query,
-                    headers={"Content-Type": "application/json"},
+                    headers=IMDB_GRAPHQL_HEADERS,
                     timeout=10
                 )
                 response.raise_for_status()

@@ -651,10 +651,10 @@ async def process_meta(meta: Meta, base_dir: str, bot: Any = None) -> None:
         if meta.get('trackers_pass') is not None:
             meta['skip_uploading'] = meta.get('trackers_pass')
         else:
-            tracker_pass_checks = config['DEFAULT'].get('tracker_pass_checks')
-            if isinstance(tracker_pass_checks, (int, str)):
-                meta['skip_uploading'] = int(tracker_pass_checks)
-            else:
+            # Blank or non-numeric values (older example configs shipped "") fall back to 1.
+            try:
+                meta['skip_uploading'] = int(config['DEFAULT'].get('tracker_pass_checks'))
+            except (TypeError, ValueError):
                 meta['skip_uploading'] = 1
 
     skip_uploading = meta.get('skip_uploading')
